@@ -357,10 +357,14 @@ async function apiGetFetch(params: {
   const controller = params.timeoutMs ? new AbortController() : undefined
   const timer = controller ? setTimeout(() => controller.abort(), params.timeoutMs) : undefined
   try {
-    const res = await fetch(url.toString(), {
+    const request = {
       method: 'GET',
       headers: buildCommonHeaders(),
       ...(controller ? { signal: controller.signal } : {}),
+    } satisfies RequestInit
+    const res = await fetchWithCurlFallback(url.toString(), request, {
+      label: params.label,
+      timeoutMs: params.timeoutMs,
     })
     const rawText = await res.text()
     if (!res.ok) throw new Error(`${params.label} ${res.status}: ${rawText}`)
@@ -382,11 +386,15 @@ async function apiPostFetch(params: {
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), params.timeoutMs)
   try {
-    const res = await fetch(url.toString(), {
+    const request = {
       method: 'POST',
       headers: buildHeaders({ token: params.token, body: params.body }),
       body: params.body,
       signal: controller.signal,
+    } satisfies RequestInit
+    const res = await fetchWithCurlFallback(url.toString(), request, {
+      label: params.label,
+      timeoutMs: params.timeoutMs,
     })
     const rawText = await res.text()
     if (!res.ok) throw new Error(`${params.label} ${res.status}: ${rawText}`)
@@ -394,6 +402,129 @@ async function apiPostFetch(params: {
   } finally {
     clearTimeout(timer)
   }
+}
+
+async function fetchWithCurlFallback(
+  url: string,
+  request: RequestInit,
+  opts: { label: string; timeoutMs?: number },
+): Promise<Response> {
+  try {
+    return await fetch(url, request)
+  } catch (err) {
+    if (!shouldUseCurlFallback(err)) throw err
+    return fetchViaCurl(url, request, opts)
+  }
+}
+
+function shouldUseCurlFallback(err: unknown): boolean {
+  if (process.platform !== 'win32') return false
+  if (err instanceof Error && err.name === 'AbortError') return false
+
+  const record = err as { code?: unknown; message?: unknown }
+  const code = typeof record?.code === 'string' ? record.code.toUpperCase() : ''
+  const message = typeof record?.message === 'string' ? record.message.toLowerCase() : ''
+
+  return code === 'ECONNREFUSED'
+    || code === 'CONNECTIONREFUSED'
+    || message.includes('connectionrefused')
+    || message.includes('unable to connect')
+}
+
+async function fetchViaCurl(
+  url: string,
+  request: RequestInit,
+  opts: { label: string; timeoutMs?: number },
+): Promise<Response> {
+  const { spawn } = await import('node:child_process')
+  const method = String(request.method || 'GET').toUpperCase()
+  const headers = normalizeHeaders(request.headers)
+  const body = typeof request.body === 'string' ? request.body : undefined
+  const marker = `__AKANE_CURL_HTTP_STATUS_${Date.now()}__`
+  const args = [
+    '-sS',
+    '-L',
+    '-X',
+    method,
+    '--max-time',
+    String(Math.max(1, Math.ceil((opts.timeoutMs ?? API_TIMEOUT_MS) / 1000))),
+  ]
+
+  for (const [key, value] of Object.entries(headers)) {
+    args.push('-H', `${key}: ${value}`)
+  }
+
+  if (body !== undefined) {
+    args.push('--data-binary', '@-')
+  }
+
+  args.push('-w', `\n${marker}:%{http_code}`, url)
+
+  const result = await new Promise<{ status: number | null; stdout: string; stderr: string }>((resolve, reject) => {
+    const child = spawn('curl.exe', args, {
+      stdio: ['pipe', 'pipe', 'pipe'],
+      windowsHide: true,
+    })
+    let stdout = ''
+    let stderr = ''
+    let settled = false
+    const timeout = setTimeout(() => {
+      settled = true
+      child.kill()
+      reject(new Error(`${opts.label} curl fallback timed out after ${opts.timeoutMs ?? API_TIMEOUT_MS}ms`))
+    }, opts.timeoutMs ?? API_TIMEOUT_MS)
+
+    child.stdout.setEncoding('utf8')
+    child.stderr.setEncoding('utf8')
+    child.stdout.on('data', (chunk) => {
+      stdout += String(chunk)
+    })
+    child.stderr.on('data', (chunk) => {
+      stderr += String(chunk)
+    })
+    child.on('error', (err) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timeout)
+      reject(err)
+    })
+    child.on('close', (status) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timeout)
+      resolve({ status, stdout, stderr })
+    })
+    child.stdin.end(body)
+  })
+
+  if (result.status !== 0) {
+    const detail = (result.stderr || result.stdout || '').trim()
+    throw new Error(`${opts.label} curl fallback failed (${result.status ?? 'unknown'}): ${detail}`)
+  }
+
+  const stdout = result.stdout || ''
+  const markerIndex = stdout.lastIndexOf(`\n${marker}:`)
+  if (markerIndex === -1) {
+    throw new Error(`${opts.label} curl fallback did not return an HTTP status`)
+  }
+
+  const rawText = stdout.slice(0, markerIndex)
+  const statusText = stdout.slice(markerIndex + marker.length + 2).trim()
+  const status = Number.parseInt(statusText, 10)
+  if (!Number.isFinite(status)) {
+    throw new Error(`${opts.label} curl fallback returned invalid HTTP status: ${statusText}`)
+  }
+
+  return new Response(rawText, { status })
+}
+
+function normalizeHeaders(headers: RequestInit['headers']): Record<string, string> {
+  if (!headers) return {}
+  if (headers instanceof Headers) return Object.fromEntries(headers.entries())
+  if (Array.isArray(headers)) {
+    return Object.fromEntries(headers.map(([key, value]) => [key, value]))
+  }
+  return Object.fromEntries(Object.entries(headers).map(([key, value]) => [key, String(value)]))
 }
 
 function buildBaseInfo(): { channel_version: string } {

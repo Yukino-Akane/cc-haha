@@ -1,11 +1,13 @@
-import { afterEach, describe, expect, it } from 'bun:test'
-import { buildClientVersion, extractWechatText, sendWechatText, sendWechatTyping } from '../protocol.js'
+import { afterEach, describe, expect, it, mock } from 'bun:test'
+import { buildClientVersion, extractWechatText, getWechatUpdates, sendWechatText, sendWechatTyping } from '../protocol.js'
 import { collectWechatMediaCandidates } from '../media.js'
+import { EventEmitter } from 'node:events'
 
 const originalFetch = globalThis.fetch
 
 afterEach(() => {
   globalThis.fetch = originalFetch
+  mock.restore()
 })
 
 describe('WeChat protocol helpers', () => {
@@ -119,5 +121,53 @@ describe('WeChat protocol helpers', () => {
       typingTicket: 'ticket',
       status: 'typing',
     })).rejects.toThrow('wechatSendTyping returned 42001: typing ticket expired')
+  })
+
+  it('falls back to curl on Windows when Bun fetch cannot reach WeChat', async () => {
+    const originalPlatform = Object.getOwnPropertyDescriptor(process, 'platform')
+    Object.defineProperty(process, 'platform', { value: 'win32' })
+    globalThis.fetch = (async () => {
+      const err = new Error('Unable to connect')
+      ;(err as Error & { code?: string }).code = 'ConnectionRefused'
+      throw err
+    }) as unknown as typeof fetch
+
+    const spawnMock = mock((_command: string, args: string[]) => {
+      const statusFormat = args[args.indexOf('-w') + 1] ?? ''
+      const child = new EventEmitter() as EventEmitter & {
+        stdin: { end: ReturnType<typeof mock> }
+        stdout: EventEmitter & { setEncoding: ReturnType<typeof mock> }
+        stderr: EventEmitter & { setEncoding: ReturnType<typeof mock> }
+        kill: ReturnType<typeof mock>
+      }
+      child.stdin = { end: mock(() => {}) }
+      child.stdout = Object.assign(new EventEmitter(), { setEncoding: mock(() => child.stdout) })
+      child.stderr = Object.assign(new EventEmitter(), { setEncoding: mock(() => child.stderr) })
+      child.kill = mock(() => true)
+      queueMicrotask(() => {
+        child.stdout.emit('data', `${JSON.stringify({ ret: 0, msgs: [], get_updates_buf: 'buf' })}${statusFormat.replace('%{http_code}', '200')}`)
+        child.emit('close', 0)
+      })
+      return child
+    })
+    mock.module('node:child_process', () => ({
+      spawn: spawnMock,
+    }))
+
+    try {
+      const resp = await getWechatUpdates({
+        baseUrl: 'https://ilinkai.weixin.qq.com',
+        token: 'token',
+        timeoutMs: 5000,
+      })
+
+      expect(resp.get_updates_buf).toBe('buf')
+      expect(spawnMock).toHaveBeenCalledTimes(1)
+      expect(spawnMock.mock.calls[0]?.[0]).toBe('curl.exe')
+      expect(spawnMock.mock.calls[0]?.[1]).toContain('-X')
+      expect(spawnMock.mock.calls[0]?.[1]).toContain('POST')
+    } finally {
+      if (originalPlatform) Object.defineProperty(process, 'platform', originalPlatform)
+    }
   })
 })

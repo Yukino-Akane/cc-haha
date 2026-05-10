@@ -4,6 +4,7 @@ import { MessageDedup } from '../common/message-dedup.js'
 import { MessageBuffer } from '../common/message-buffer.js'
 import { enqueue } from '../common/chat-queue.js'
 import { getConfiguredWorkDir, loadConfig } from '../common/config.js'
+import { acquireAdapterLock, AdapterLockError } from '../common/adapter-lock.js'
 import {
   formatImHelp,
   formatImStatus,
@@ -35,9 +36,21 @@ import { collectWechatMediaCandidates, WechatMediaService } from './media.js'
 const WECHAT_TEXT_LIMIT = 3500
 const GET_UPDATES_TIMEOUT_MS = 35_000
 
+let adapterLock
+try {
+  adapterLock = acquireAdapterLock('wechat')
+} catch (err) {
+  if (err instanceof AdapterLockError) {
+    console.error(`[WeChat] ${err.message}`)
+    process.exit(0)
+  }
+  throw err
+}
+
 const config = loadConfig()
 if (!config.wechat.botToken || !config.wechat.accountId) {
   console.error('[WeChat] Missing QR-bound account. Bind WeChat in Desktop Settings > IM.')
+  adapterLock.release()
   process.exit(1)
 }
 
@@ -628,5 +641,16 @@ process.on('SIGINT', () => {
   typingController.destroy()
   bridge.destroy()
   dedup.destroy()
+  adapterLock.release()
+  process.exit(0)
+})
+
+process.on('SIGTERM', () => {
+  console.log('[WeChat] Shutting down...')
+  stopped = true
+  typingController.destroy()
+  bridge.destroy()
+  dedup.destroy()
+  adapterLock.release()
   process.exit(0)
 })
