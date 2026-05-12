@@ -328,7 +328,7 @@ function getOrBind(): Binding {
 }
 
 /**
- * Returns the full override object for a single `mcp__computer-use__{toolName}`
+ * Returns the full override object for a single `mcp__akane-computer-use__{toolName}`
  * tool: rendering overrides from `toolRendering.tsx` plus a `.call()` that
  * dispatches through the cached binder.
  */
